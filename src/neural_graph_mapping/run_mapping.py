@@ -21,6 +21,7 @@ import rerun as rr
 import tabulate
 import torch
 import tqdm
+import wandb
 import yoco
 from pytorch3d import transforms as p3dt
 from pytorch3d.io.ply_io import _save_ply as save_ply
@@ -29,7 +30,6 @@ from pytorch3d.ops.marching_cubes import marching_cubes
 from pytorch3d.transforms import quaternion_apply, quaternion_invert
 from torch.utils.data import DataLoader
 
-import wandb
 from neural_graph_mapping import (
     camera,
     evaluation,
@@ -352,17 +352,17 @@ class NeuralGraphMap:
         }
 
     def _init_optimizer(self) -> torch.optim.Optimizer:
-        if self._single_field_id or self._monolithic:
+        if self._use_multiple_fields:
+            # add parameters as they are initialized
             self._optimizer = torch.optim.Adam(
-                self._model.parameters(),
+                [torch.autograd.Variable(torch.tensor(0.0, device="cuda"))],
                 lr=self._learning_rate,
                 eps=self._adam_eps,
                 weight_decay=self._adam_weight_decay,
             )
         else:
-            # add parameters as they are initialized
             self._optimizer = torch.optim.Adam(
-                [torch.autograd.Variable(torch.tensor(0.0, device="cuda"))],
+                self._model.parameters(),
                 lr=self._learning_rate,
                 eps=self._adam_eps,
                 weight_decay=self._adam_weight_decay,

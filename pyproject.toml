@@ -42,6 +42,9 @@ Repository = "https://github.com/roym899/neural_graph_mapping"
 [tool.black]
 line-length = 95
 
+[tool.isort]
+known_third_party = ["wandb"]
+
 [tool.ruff]
 line-length = 95
 select = ["E", "F", "ANN", "D", "W"]
