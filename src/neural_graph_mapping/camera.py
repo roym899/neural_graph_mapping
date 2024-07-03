@@ -79,7 +79,7 @@ class Camera:
         self.width = width
         self.height = height
 
-    def get_o3d_pinhole_camera_parameters(self) -> o3d.camera.PinholeCameraParameters():
+    def get_o3d_pinhole_camera_parameters(self) -> o3d.camera.PinholeCameraParameters:
         """Convert camera to Open3D pinhole camera parameters.
 
         Open3D camera is at (0,0,0) looking along positive z axis (i.e., positive z

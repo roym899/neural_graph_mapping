@@ -64,7 +64,7 @@ def benchmark(f: Callable) -> Callable:
     Can be globally enabled / disabled by setting benchmark.enabled to True / False.
     """
     if not hasattr(benchmark, "enabled"):
-        benchmark.enabled = True
+        benchmark.enabled = False
 
     if not hasattr(benchmark, "indent"):
         benchmark.indent = 0

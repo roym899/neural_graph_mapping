@@ -21,7 +21,6 @@ import rerun as rr
 import tabulate
 import torch
 import tqdm
-import wandb
 import yoco
 from pytorch3d import transforms as p3dt
 from pytorch3d.io.ply_io import _save_ply as save_ply
@@ -30,6 +29,7 @@ from pytorch3d.ops.marching_cubes import marching_cubes
 from pytorch3d.transforms import quaternion_apply, quaternion_invert
 from torch.utils.data import DataLoader
 
+import wandb
 from neural_graph_mapping import (
     camera,
     evaluation,
@@ -171,7 +171,13 @@ class NeuralGraphMap:
 
         self._color_factor = config.get("color_factor", 1.0)
         self._geometry_factor = config.get("geometry_factor", 1.0)
+
+        # ablations to disable multi field representation
         self._single_field_id = config["single_field_id"]
+        self._monolithic = config.get("monolithic", False)
+        assert not (
+            self._single_field_id is not None and self._monolithic
+        ), "Can't use single field id and monolithic at the same time."
 
         self._update_mode = config["update_mode"]
 
@@ -338,14 +344,15 @@ class NeuralGraphMap:
             num_new, device=self._device, dtype=torch.long
         )
 
-        self._add_fields(num_new)
+        if self._use_multiple_fields:
+            self._add_fields(num_new)
 
         self._kf2fields[frame_id] = {
             field_id for field_id in range(num_prev, self._global_map_dict["num"])
         }
 
     def _init_optimizer(self) -> torch.optim.Optimizer:
-        if self._single_field_id:
+        if self._single_field_id or self._monolithic:
             self._optimizer = torch.optim.Adam(
                 self._model.parameters(),
                 lr=self._learning_rate,
@@ -361,15 +368,15 @@ class NeuralGraphMap:
                 weight_decay=self._adam_weight_decay,
             )
 
+    @property
+    def _use_multiple_fields(self) -> bool:
+        return self._single_field_id is None and not self._monolithic
+
     @utils.benchmark
     def _add_fields(self, num_new: int) -> None:
-        if self._single_field_id is not None:
-            return
-
         self._model.add_fields(num_new)
 
         # NOTE below we manually maintain the optimizer's internal state
-        num_total = self._global_map_dict["num"]
         all_params = self._model.all_fields_params
         param_names = all_params.keys()
         new_state = {}
@@ -574,7 +581,7 @@ class NeuralGraphMap:
                     ),
                 )
 
-        if self._single_field_id is None:
+        if self._use_multiple_fields:
             if use_vmap:
                 sample_outs = self._model(
                     points_world.reshape(len(field_ids), -1, 3),
@@ -594,18 +601,22 @@ class NeuralGraphMap:
                 )
                 sample_outs = sample_outs.view(*leading_dims, 4)
         else:
-            field_points_world = points_world[field_ids == self._single_field_id]
-            field_position = field_positions[field_ids == self._single_field_id]
-            field_orientation = field_orientations[field_ids == self._single_field_id]
-            sample_distances = sample_distances[field_ids == self._single_field_id][0]
-            points_cam = points_cam[field_ids == self._single_field_id][0]
-            field_points_local = field_points_world - field_position
-            field_points_local = quaternion_apply(
-                quaternion_invert(field_orientation), field_points_local
-            )
+            if self._single_field_id is not None:
+                field_points_world = points_world[field_ids == self._single_field_id]
+                field_position = field_positions[field_ids == self._single_field_id]
+                field_orientation = field_orientations[field_ids == self._single_field_id]
+                sample_distances = sample_distances[field_ids == self._single_field_id][0]
+                points_cam = points_cam[field_ids == self._single_field_id][0]
+                field_points_local = field_points_world - field_position
+                field_points_local = quaternion_apply(
+                    quaternion_invert(field_orientation), field_points_local
+                )
+            else:
+                field_points_local = points_world
+                # TODO apply bb scaling potentially here
             sample_outs = self._model(field_points_local.view(-1, 3)).view(
                 field_points_local.shape[1], field_points_local.shape[2], 4
-            )
+            )  # why this view thing doesn't it work without?
 
         sample_colors = self._color_factor * sample_outs[..., :3]
         sample_densities = sample_outs[..., 3]
@@ -625,11 +636,15 @@ class NeuralGraphMap:
             mask = sample_distances < (gt_distances[..., None] - self._truncation_distance) * (
                 gt_distances[..., None] != 0.0
             )
+            if self._single_field_id is not None:
+                mask = mask[field_ids == self._single_field_id][0]
             freespace_distances = sample_densities[mask] * self._truncation_distance
         else:
             freespace_distances = None
 
         if self._tsdf_weight != 0.0 and gt_distances is not None:
+            if self._single_field_id is not None:
+                gt_distances = gt_distances[field_ids == self._single_field_id][0]
             deltas = gt_distances[..., None] - sample_distances
             mask = (torch.abs(deltas) < self._truncation_distance) * (
                 gt_distances[..., None] != 0.0
@@ -642,8 +657,6 @@ class NeuralGraphMap:
             neus_isds = 1.0 / torch.abs(
                 self._model.vmap_fields_params["_neus_sd"].view(-1, 1, 1)
             )
-        elif self._geometry_mode == "neus" and use_vmap:
-            breakpoint()
         else:
             neus_isds = None
 
@@ -1187,11 +1200,9 @@ class NeuralGraphMap:
 
         self._global_map_dict["training_iterations"][field_ids] += 1
 
-        if self._single_field_id is not None:
-            self._optimizer.step()
-        else:
-            self._optimizer.step()
+        self._optimizer.step()
 
+        if self._use_multiple_fields:
             all_params = self._model.all_fields_params
             vmap_params = self._model.vmap_fields_params
             param_names = vmap_params.keys()
