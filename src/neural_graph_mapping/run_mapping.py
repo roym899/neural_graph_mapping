@@ -119,8 +119,6 @@ class NeuralGraphMap:
         self._dataset_config = config["dataset_config"]
         self._model_type = utils.str_to_object(config["model_type"])
         self._model_kwargs = config["model_kwargs"]
-        self._field_type = utils.str_to_object(config["model_kwargs"]["field_type"])
-        self._field_kwargs = config["model_kwargs"]["field_kwargs"]
         self._device = config["device"]
         self._learning_rate = config["learning_rate"]
         self._adam_eps = config["adam_eps"]
@@ -228,7 +226,9 @@ class NeuralGraphMap:
     def _init_model(self) -> None:
         """Initialize model and load weights if self._model_path is not None."""
         if self._single_field_id:
-            self._model = self._field_type(**self._field_kwargs)
+            field_type = utils.str_to_object(self._model_kwargs["field_type"])
+            field_kwargs = self._model_kwargs["field_kwargs"]
+            self._model = field_type(**field_kwargs)
             self._model.to(self._device)
         else:
             self._model = self._model_type(**self._model_kwargs)
@@ -602,7 +602,7 @@ class NeuralGraphMap:
                 sample_outs = sample_outs.view(*leading_dims, 4)
         else:
             if self._single_field_id is not None:
-                field_points_world = points_world[field_ids == self._single_field_id]
+                field_points_world = points_world[field_ids == self._single_field_id][0]
                 field_position = field_positions[field_ids == self._single_field_id]
                 field_orientation = field_orientations[field_ids == self._single_field_id]
                 sample_distances = sample_distances[field_ids == self._single_field_id][0]
@@ -614,9 +614,10 @@ class NeuralGraphMap:
             else:
                 field_points_local = points_world
                 # TODO apply bb scaling potentially here
-            sample_outs = self._model(field_points_local.view(-1, 3)).view(
-                field_points_local.shape[1], field_points_local.shape[2], 4
-            )  # why this view thing doesn't it work without?
+            leading_dims = field_points_local.shape[:-1]
+            sample_outs = self._model(field_points_local.reshape(-1, 3)).reshape(
+                *leading_dims, -1
+            )
 
         sample_colors = self._color_factor * sample_outs[..., :3]
         sample_densities = sample_outs[..., 3]
@@ -681,9 +682,6 @@ class NeuralGraphMap:
     @utils.benchmark
     @torch.no_grad()
     def _set_vmap_fields(self, field_ids: torch.Tensor) -> None:
-        if self._single_field_id is not None:
-            return
-
         self._model.set_vmap_fields(field_ids)
 
         # only update the vmapped fields
@@ -1182,7 +1180,7 @@ class NeuralGraphMap:
             far_distances=target.far_distances,
             gt_distances=target.gt_distances,
             field_ids=target.field_ids,
-            use_vmap=True,
+            use_vmap=self._use_multiple_fields,
         )
 
         loss_dict = self._compute_losses(target, prediction)
@@ -2205,10 +2203,15 @@ class NeuralGraphMap:
         log_to_rerun: bool = False,
     ) -> None:
         """Extract mesh from scene representation."""
-        if self._single_field_id is None:
-            # get bounding box of mapped area from fields + radius
-            field_positions = self._global_map_dict["positions"][: self._num_fields]
-            field_orientations = self._global_map_dict["orientations"][: self._num_fields]
+        if self._single_field_id is None and field_ids is None:
+            field_positions = self._global_map_dict["positions"][:self._num_fields]
+            field_orientations = self._global_map_dict["orientations"][:self._num_fields]
+        elif self._single_field_id is None and field_ids is not None:
+            field_ids = field_ids[field_ids < self._num_fields]
+            if len(field_ids) == 0:
+                return
+            field_positions = self._global_map_dict["positions"][field_ids]
+            field_orientations = self._global_map_dict["orientations"][field_ids]
         else:
             if self._num_fields <= self._single_field_id:
                 return
@@ -2222,14 +2225,6 @@ class NeuralGraphMap:
             transform = torch.eye(4, device=self._device)
         field_positions = utils.transform_points(field_positions, transform)
         field_orientations = utils.transform_quaternions(field_orientations, transform)
-
-        if self._single_field_id is None:
-            if field_ids is not None:
-                field_ids = field_ids[field_ids < self._num_fields]
-                if len(field_ids) == 0:
-                    return
-                field_positions = field_positions[field_ids]
-                field_orientations = field_orientations[field_ids]
 
         min_x, min_y, min_z = field_positions.min(dim=0)[0] - 2 * self._field_radius
         max_x, max_y, max_z = field_positions.max(dim=0)[0] + 2 * self._field_radius
@@ -2262,7 +2257,7 @@ class NeuralGraphMap:
             block_zs = all_zs[z_s : z_s + BLOCK_SIZE + 1]
             xyzs = torch.cartesian_prod(block_xs, block_ys, block_zs)
 
-            if self._single_field_id is None:
+            if self._use_multiple_fields is None:
                 outs = utils.batched_evaluation(
                     lambda x: self._model(
                         x, field_positions, field_orientations, field_ids, use_vmap=False
@@ -2271,10 +2266,14 @@ class NeuralGraphMap:
                     self._block_size,
                 )
             else:
-                xyzs_local = xyzs - field_positions
-                xyzs_local = quaternion_apply(
-                    quaternion_invert(field_orientations), xyzs_local
-                )
+                if self._single_field_id is not None:
+                    xyzs_local = xyzs - field_positions
+                    xyzs_local = quaternion_apply(
+                        quaternion_invert(field_orientations), xyzs_local
+                    )
+                else:
+                    xyzs_local = utils.transform_points(xyzs, transform, inv=True)
+                    # TODO apply bb scaling potentially here
                 outs = self._model(xyzs_local)
 
             volume = outs[:, 3].reshape(1, len(block_xs), len(block_ys), len(block_zs))
@@ -2327,7 +2326,7 @@ class NeuralGraphMap:
                 (block_verts[:, 2], block_verts[:, 1], block_verts[:, 0]), dim=-1
             )
 
-            if self._single_field_id is None:
+            if self._use_multiple_fields:
                 outs = utils.batched_evaluation(
                     lambda x: self._model(
                         x,
@@ -2342,10 +2341,14 @@ class NeuralGraphMap:
                     self._block_size,
                 )
             else:
-                block_verts_xyz_local = block_verts_xyz - field_positions
-                block_verts_xyz_local = quaternion_apply(
-                    quaternion_invert(field_orientations), block_verts_xyz_local
-                )
+                if self._single_field_id is not None:
+                    block_verts_xyz_local = block_verts_xyz - field_positions
+                    block_verts_xyz_local = quaternion_apply(
+                        quaternion_invert(field_orientations), block_verts_xyz_local
+                    )
+                else:
+                    block_verts_xyz_local = utils.transform_points(block_verts_xyz, transform, inv=True)
+                    # TODO apply bb scaling potentially here
                 outs = self._model(block_verts_xyz_local)
 
             block_vert_colors = torch.clamp(self._color_factor * outs[..., :3], 0, 1) * 255
