@@ -2221,6 +2221,7 @@ class NeuralGraphMap:
                 None
             ]
 
+
         if transform is None:
             transform = torch.eye(4, device=self._device)
         field_positions = utils.transform_points(field_positions, transform)
@@ -2257,7 +2258,7 @@ class NeuralGraphMap:
             block_zs = all_zs[z_s : z_s + BLOCK_SIZE + 1]
             xyzs = torch.cartesian_prod(block_xs, block_ys, block_zs)
 
-            if self._use_multiple_fields is None:
+            if self._use_multiple_fields:
                 outs = utils.batched_evaluation(
                     lambda x: self._model(
                         x, field_positions, field_orientations, field_ids, use_vmap=False
